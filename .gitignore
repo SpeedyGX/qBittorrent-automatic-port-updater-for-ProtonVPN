@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local configuration (may contain secrets) - do not commit.
+# The protonport.conf.example template stays in the repository.
+protonport.conf
+*.local
+
+# Logs / test output
+*.log

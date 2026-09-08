@@ -1,0 +1,29 @@
+[Unit]
+Description=qBittorrent listen port updater from ProtonVPN forwarded port
+# GUI apps (ProtonVPN and qBittorrent) start with the KDE session; this unit is user-scope
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The script is installed to ~/.local/bin (no spaces in the path) => ExecStart needs no escaping.
+# Note: the workspace path contains spaces; do NOT run the unit directly from the workspace.
+ExecStart=%h/.local/bin/protonport.py --config %h/.config/protonport/protonport.conf
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+
+# --- Optional security hardening (uncomment and test) ---
+# NoNewPrivileges=true
+# PrivateTmp=true
+# ProtectSystem=full
+# ProtectHome=read-only          # the script only reads the log; state is written only to ReadWritePaths
+# ReadWritePaths=%h/.local/state/protonport %h/.config/protonport
+# ProtectKernelTunables=true
+# ProtectControlGroups=true
+# RestrictSUIDSGID=true
+
+[Install]
+WantedBy=default.target

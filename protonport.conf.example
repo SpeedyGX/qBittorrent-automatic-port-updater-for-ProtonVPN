@@ -1,0 +1,28 @@
+{
+  "log_path": "~/.cache/Proton/VPN/logs/vpn-app.log",
+  "state_dir": "~/.local/state/protonport",
+  "own_log_file": "",
+  "log_level": "INFO",
+
+  "qbittorrent": {
+    "base_url": "http://127.0.0.1:8080",
+    "username": "user",
+    "password": "__CHANGE_ME__",
+    "api_key": "",
+    "http_timeout_s": 10,
+    "insecure_https": false
+  },
+
+  "intervals": {
+    "connected_s": 15,
+    "offline_s": 60,
+    "qbit_backoff_base_s": 5,
+    "qbit_backoff_max_s": 120,
+    "auth_backoff_base_s": 60,
+    "auth_backoff_max_s": 600
+  },
+
+  "tail_scan_bytes": 1048576,
+  "dry_run": false,
+  "force_on_start": false
+}

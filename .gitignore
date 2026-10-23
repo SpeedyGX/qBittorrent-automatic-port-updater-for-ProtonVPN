@@ -20,3 +20,4 @@ protonport.conf
 
 # Logs / test output
 *.log
+/graphify-out

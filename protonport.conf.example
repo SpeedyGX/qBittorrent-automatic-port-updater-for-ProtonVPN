@@ -16,6 +16,7 @@
   "intervals": {
     "connected_s": 15,
     "offline_s": 60,
+    "reconcile_s": 300,
     "qbit_backoff_base_s": 5,
     "qbit_backoff_max_s": 120,
     "auth_backoff_base_s": 60,

@@ -51,7 +51,7 @@ for arg in "$@"; do
   case "$arg" in
     --install-only) DO_SYSTEMD=0 ;;
     --uninstall)    DO_UNINSTALL=1 ;;
-    -h|--help)      grep -E "^# " "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)      sed -n '2,/^set -euo/p' "$0" | sed -n 's/^# \{0,1\}//p'; exit 0 ;;
     *) echo "Unknown argument: $arg" >&2; echo "Usage: $0 [--install-only|--uninstall]" >&2; exit 2 ;;
   esac
 done
@@ -69,10 +69,20 @@ if [[ "$DO_UNINSTALL" -eq 1 ]]; then
   fi
   echo "[2/3] Removing the script $BIN_PATH ..."
   rm -f "$BIN_PATH"
-  echo "[3/3] Removing the unit and the state (the config ~/.config/protonport is KEPT - it holds secrets)."
+  echo "[3/3] Removing the state (the config ~/.config/protonport is KEPT - it holds secrets)."
   rm -rf "$HOME/.local/state/protonport"
   echo "=== done. Remove the config manually if you want: rm -i $CFG_PATH ==="
   exit 0
+fi
+
+# --- prerequisites ---------------------------------------------------------
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "ERROR: python3 was not found in PATH." >&2
+  exit 1
+fi
+if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)'; then
+  echo "ERROR: Python 3.8 or newer is required." >&2
+  exit 1
 fi
 
 # --- 1) script ------------------------------------------------------------
@@ -98,24 +108,60 @@ echo "[3/5] systemd unit -> $UNIT_PATH (0644)"
 mkdir -p "$UNIT_DIR"
 install -m 644 "$UNIT_SRC" "$UNIT_PATH"
 
+# Returns 0 when the config has usable qBittorrent credentials (API key, or
+# username+password; env variables count as well). Keeps the installer from
+# starting a service that would only exit with a configuration error.
+credentials_configured() {
+  python3 - "$CFG_PATH" <<'PY'
+import json, os, sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        cfg = json.load(fh)
+except (OSError, ValueError):
+    sys.exit(1)
+if not isinstance(cfg, dict):
+    sys.exit(1)
+qb = cfg.get("qbittorrent") or {}
+if not isinstance(qb, dict):
+    sys.exit(1)
+
+def clean(value):
+    value = str(value or "").strip()
+    return "" if value == "__CHANGE_ME__" else value
+
+api_key = clean(os.environ.get("PROTONPORT_QBIT_API_KEY")) or clean(qb.get("api_key"))
+username = clean(qb.get("username"))
+password = clean(os.environ.get("PROTONPORT_QBIT_PASSWORD")) or clean(qb.get("password"))
+sys.exit(0 if api_key or (username and password) else 1)
+PY
+}
+
 # --- 4) syntax check of the installed script -------------------------------
 echo "[4/5] py_compile: $BIN_PATH"
 python3 -m py_compile "$BIN_PATH"
 
 echo "[5/5] Done - files are in place."
 echo
-echo "Test log parsing (read-only, no login):"
+echo "Test log parsing and the current state (read-only, works while the service runs):"
 echo "  $BIN_PATH --config $CFG_PATH --check"
-echo "Test a single sync cycle (once the credentials are filled in):"
+echo "To test a single sync cycle, stop the service first (the lock is single-instance):"
+echo "  systemctl --user stop $UNIT_NAME"
 echo "  $BIN_PATH --config $CFG_PATH --once --dry-run"
 
 if [[ "$DO_SYSTEMD" -eq 1 ]]; then
   echo
-  echo "Starting the systemd --user service ..."
-  if ! command -v systemctl >/dev/null 2>&1; then
-    echo "  systemctl not found - skipped. Start it manually:" >&2
+  if ! credentials_configured; then
+    echo "qBittorrent credentials are NOT configured (or the config is invalid) - the service was NOT started."
+    echo "Fill them in first (api_key, or username + password):"
+    echo "  $EDITOR $CFG_PATH"
+    echo "Then (if needed) expose the password/key to systemd, and start the service:"
+    echo "  systemctl --user daemon-reload && systemctl --user enable --now $UNIT_NAME"
+  elif ! command -v systemctl >/dev/null 2>&1; then
+    echo "systemctl not found - the service was not started. Start it manually:" >&2
     echo "  systemctl --user daemon-reload && systemctl --user enable --now $UNIT_NAME" >&2
   else
+    echo "Starting the systemd --user service ..."
     systemctl --user daemon-reload
     systemctl --user enable --now "$UNIT_NAME"
     # Hardening: verify that the unit physically exists and is enabled - so that

@@ -11,6 +11,9 @@ Type=simple
 ExecStart=%h/.local/bin/protonport.py --config %h/.config/protonport/protonport.conf
 Restart=on-failure
 RestartSec=5
+# Exit code 78 = configuration/credentials error. Do NOT restart in that case:
+# without this, a not-yet-filled-in config would restart every 5 s forever.
+RestartPreventExitStatus=78
 StandardOutput=journal
 StandardError=journal
 Environment=PYTHONUNBUFFERED=1

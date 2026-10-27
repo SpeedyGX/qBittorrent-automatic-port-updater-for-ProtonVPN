@@ -35,11 +35,12 @@ What happens on a **VPN reconnect**:
 The script **self-heals**:
 
 - On every start it runs a "self-healing" sync - it compares the current port from the log with the port in qBittorrent and fixes it right away if needed.
+- Every `reconcile_s` (default 300 s) it repeats that comparison, so a change made manually in qBittorrent (or a stale port after a qBittorrent restart) is corrected even when the VPN port itself did not change.
 - If qBittorrent is temporarily unavailable, it remembers the port and retries with an increasing delay (backoff) until it recovers.
 
 ## 3. Requirements
 
-- **Python 3** - already in the system (the ProtonVPN app runs on it too). The program uses **only the standard library**, so **nothing else needs to be installed** (no `pip`, no `curl`/`jq`).
+- **Python 3.8+** - already in the system (the ProtonVPN app runs on it too). The program uses **only the standard library**, so **nothing else needs to be installed** (no `pip`, no `curl`/`jq`). The installer checks the version.
 - **qBittorrent** running as a GUI with the **Web UI enabled** at `http://127.0.0.1:8080` (with an HTTPS Web UI: `https://127.0.0.1:8080` + `insecure_https: true`; the port does not change) and authentication configured - via the **API key** (recommended) or a username/password.
 - **ProtonVPN (GUI)** with **port forwarding** enabled (without it no port appears in the log).
 - The `Session\Interface=proton0` setting in qBittorrent (so it only listens on the VPN tunnel) - usually already set for a normal user.
@@ -61,9 +62,9 @@ What the installer does:
 2. Creates the config `~/.config/protonport/protonport.conf` from the template (mode `0600`). **If the config already exists, it is not overwritten** - only a notice is shown.
 3. Copies the systemd service to `~/.config/systemd/user/protonport.service`.
 4. Verifies the syntax of the installed script (`py_compile`).
-5. Runs `daemon-reload` and enables and starts the service (`systemctl --user enable --now`).
+5. Runs `daemon-reload` and enables and starts the service (`systemctl --user enable --now`) - but **only when the config already contains usable credentials**. Otherwise it prints how to finish the setup (this prevents a restart loop on an unfilled config).
 
-> ⚠️ After installing you **still need to fill in the qBittorrent Web UI credentials** in the config - either `api_key` (recommended) or `username` + `password` - see [Configuration](#5-configuration). Until you do, the watcher will not start (it exits with an error), because secrets are never stored in the code or in the template.
+> ⚠️ After installing you **still need to fill in the qBittorrent Web UI credentials** in the config - either `api_key` (recommended) or `username` + `password` - see [Configuration](#5-configuration). Until you do, the watcher will not start (it exits with code 78), because secrets are never stored in the code or in the template. The installer detects missing credentials and does **not** start the service in that case; fill them in and start it afterwards (the installer prints the exact command).
 
 ### Installer options
 
@@ -137,6 +138,7 @@ $EDITOR ~/.config/protonport/protonport.conf
   "intervals": {
     "connected_s": 15,          // how often to read the log while the VPN is running
     "offline_s": 60,            // how often to retry when the log/VPN is absent
+    "reconcile_s": 300,         // periodic re-check that qBittorrent still has the right port
     "qbit_backoff_base_s": 5,   // wait when qBittorrent is unavailable (start)
     "qbit_backoff_max_s": 120,  // maximum wait when qBittorrent is unavailable
     "auth_backoff_base_s": 60,  // wait on a failed login (start)
@@ -153,7 +155,7 @@ $EDITOR ~/.config/protonport/protonport.conf
 }
 ```
 
-> ℹ️ The configuration is **validated** at startup - an unknown or missing key, a typo or an empty password is rejected with a clear message. That protects you from a silent failure.
+> ℹ️ The configuration is **validated** at startup - an unknown key, a wrong type or an empty required value is rejected with a clear message. **Missing keys use the built-in defaults** (so a partial `qbittorrent`/`intervals` section is fine), and a watcher run without usable credentials exits with code 78. That protects you from a silent failure.
 
 ### Authentication - two options
 
@@ -168,6 +170,12 @@ qBittorrent 5.2+ supports a native API key: *Tools -> Options -> Web UI -> Authe
 ```
 
 The script then sends the key on **every** request as the HTTP header `Authorization: Bearer <key>`. The session created by the key **never expires** (no re-login) and the server **skips the CSRF check** in this mode. Advantages: no plaintext password on disk and you can **revoke / regenerate** the key in qBittorrent at any time (then just update the config and restart the service). After switching to the key you can safely delete both `username` and `password` from the config.
+
+Like the password, the key can also be passed via the **`PROTONPORT_QBIT_API_KEY`** environment variable (it takes priority over the config value):
+
+```bash
+export PROTONPORT_QBIT_API_KEY='qbt_<32_character_key>'
+```
 
 **Option 2: username + password - `qbittorrent.username` + `qbittorrent.password`**
 
@@ -188,15 +196,15 @@ The classic Web UI login with a username and password (SID cookie + CSRF `Refere
 
    The password in the config can then stay empty or with the placeholder. Note: for a systemd service the variable must also be set for the service (e.g. in `~/.config/environment.d/`) so that the service can see it.
 
-> The config is valid when **`api_key` OR (`username` AND `password`)** is set. Watcher modes (`--once`, the service) without either exit with a clear error; `--check` still runs (diagnostics) and only reports that qBittorrent was not contacted because the credentials are missing.
+> The config is valid when **`api_key` OR (`username` AND `password`)** is set. Watcher modes (`--once`, the service) without either exit with code **78** and a clear error (the systemd unit is configured not to restart on that code); `--check` still runs (diagnostics) and only reports that qBittorrent was not contacted because the credentials are missing.
 
 ### Changing the qBittorrent Web UI port / credentials
 
 If you change the **port**, **password** or **API key** of the qBittorrent Web UI (in qBittorrent: *Tools -> Options -> Web UI*), mirror the change here too:
 
 - new **port/URL** -> the `qbittorrent.base_url` key,
-- new **password** -> the `qbittorrent.password` key (or the environment variable),
-- rotation/new **API key** -> the `qbittorrent.api_key` key (used instead of username/password).
+- new **password** -> the `qbittorrent.password` key (or `PROTONPORT_QBIT_PASSWORD`),
+- rotation/new **API key** -> the `qbittorrent.api_key` key (or `PROTONPORT_QBIT_API_KEY`; used instead of username/password).
 
 Restart the service after every config change - see *Running in the background*.
 
@@ -219,6 +227,8 @@ It prints:
 - which authentication mode will be used (`Auth: API key` / `Auth: user/password`) - without printing the key or password,
 - (when credentials are set) the qBittorrent version and its current `listen_port`, plus whether everything is in sync.
 
+Exit code `0` = in sync (or nothing to compare), `4` = **out of sync**, `1` = qBittorrent unavailable/auth failed, `78` = config error. That makes `--check` usable from monitoring scripts.
+
 ### A test that does not touch qBittorrent: `--once --dry-run`
 
 [`--dry-run`](protonport.py) guarantees that **no setting is ever changed** - the script only inspects the state and logs what it would do. [`--once`](protonport.py) runs one synchronization cycle and exits (no long-running process).
@@ -229,7 +239,7 @@ It prints:
 
 In the log you will then see e.g. `DRY-RUN: would set listen_port=...` - **nothing was actually changed.**
 
-> ⚠️ Note: `--once` (even with `--dry-run`) already requires the credentials (`api_key` OR `username`+`password`), because it logs into the Web UI to compare ports. Only `--check` runs without them.
+> ⚠️ Note: `--once` (even with `--dry-run`) already requires the credentials (`api_key` OR `username`+`password`), because it logs into the Web UI to compare ports. Only `--check` runs without them. It also uses the single-instance lock, so **stop the service first** (`systemctl --user stop protonport.service`) - otherwise it exits with code `3`. A finished cycle that could not confirm a sync exits with code `4` (useful for cron).
 
 ## 7. Running in the background
 
@@ -300,10 +310,12 @@ protonport.py [--config PATH] [--dry-run] [--force] [--once] [--check] [--versio
 
 | Code | Meaning |
 |---|---|
-| `0` | Success / normal end (including `Ctrl+C` interruption) |
-| `1` | Error - e.g. a bad config, missing `api_key`/placeholder password (in watcher modes), an unexpected error |
+| `0` | Success / normal end (including `Ctrl+C` interruption), or `--check` found everything in sync |
+| `1` | Unexpected error, or `--check` could not read qBittorrent (unavailable / auth failed) |
 | `2` | Incorrect usage - an unknown switch (shows help) |
 | `3` | Another instance is already running (the `flock` single-instance lock) |
+| `4` | `--once` / `--check`: the port could not be confirmed as in sync (qBittorrent unavailable, backoff active, or a drift was found) |
+| `78` | Configuration/credentials error (sysexits `EX_CONFIG`); the systemd unit does not restart on this code |
 
 ## 9. Troubleshooting (FAQ)
 
@@ -337,7 +349,7 @@ The port is only visible in the ProtonVPN log. In `~/.cache/Proton/VPN/logs/vpn-
 
 ## 10. Security notes
 
-- **No secret (password or API key) is in the code or in the repository.** Secrets are stored in the config with mode `0600`; the password can also be passed via the `PROTONPORT_QBIT_PASSWORD` environment variable. It is never passed as a command-line argument (it would be visible in the process list).
+- **No secret (password or API key) is in the code or in the repository.** Secrets are stored in the config with mode `0600`; the password/API key can also be passed via the `PROTONPORT_QBIT_PASSWORD` / `PROTONPORT_QBIT_API_KEY` environment variable. They are never passed as command-line arguments (that would be visible in the process list).
 - **The config with the secrets has mode `0600`** (only the owner can read it). At startup the script checks the mode and warns on wider access - recommending `chmod 600`.
 - **The API key is a secret just like the password** - never print it into the output, the log or git. When you switch to `api_key`, you can **delete both `password` and `username`** from the config (the key has priority and the password is no longer stored in plaintext on disk).
 - **No secrets are logged** - neither the key nor the password ever appears in the log or in the service output (journalctl).

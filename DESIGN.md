@@ -79,9 +79,13 @@ qBittorrent port updater for ProtonVPN/   <- workspace (a path with spaces)
 ├── DESIGN.md                 <- this file (specification)
 ├── README.md                 <- concise overview: purpose, install, usage, troubleshooting
 ├── LICENSE                   <- MIT (optional, recommended)
-├── protonport.py             <- THE ONLY script (Python 3, pure stdlib) - implemented by Code mode
+├── protonport.py             <- THE ONLY runtime script (Python 3, pure stdlib)
 ├── protonport.conf.example   <- config template with a password placeholder (mode 0644, NEVER with a password)
-└── protonport.service        <- systemd --user unit (template for install to ~/.config/systemd/user)
+├── protonport.service        <- systemd --user unit (template for install to ~/.config/systemd/user)
+├── install.sh                <- installer/uninstaller helper
+├── tests/
+│   └── test_protonport.py    <- stdlib unittest suite (fake qBittorrent Web API)
+└── .github/workflows/ci.yml  <- ruff + pylint (errors only) + tests
 ```
 
 **Target (installed) runtime locations** (space-free, recommended and used in the systemd unit):
@@ -103,9 +107,9 @@ qBittorrent port updater for ProtonVPN/   <- workspace (a path with spaces)
 - Format **JSON** (parsed with the pure stdlib `json`).
 - Runtime config: `~/.config/protonport/protonport.conf`, mode **0600**, owner = the user.
 - Template in the repository: `protonport.conf.example` (contains the `__CHANGE_ME__` placeholder, never a real password). Installation: copy and fill in the credentials.
-- The password is **never in the code or in the repository**. It is only in the config (0600) or optionally in the `PROTONPORT_QBIT_PASSWORD` env variable, which takes priority (it lets you keep the password off the disk entirely). The code contains no default password.
-- Value precedence: **command line** (the `--dry-run`, `--force`, `--config` switches) > **env** (password) > **JSON config** > **built-in defaults**.
-- Validation at startup: unknown keys - error (protection against typos); missing/required keys - error with a readable report; a password equal to the placeholder or empty while env is not set - **refuse to start** with instructions.
+- The password/API key are **never in the code or in the repository**. They are only in the config (0600) or optionally in the `PROTONPORT_QBIT_PASSWORD` / `PROTONPORT_QBIT_API_KEY` env variables, which take priority (they let you keep the secrets off the disk entirely). The code contains no default secret.
+- Value precedence: **command line** (the `--dry-run`, `--force`, `--config` switches) > **env** (password/API key) > **JSON config** > **built-in defaults**.
+- Validation at startup: unknown keys, wrong types and invalid values (e.g. a non-http(s) `base_url`) - error (protection against typos); **missing keys use the built-in defaults** (a partial `qbittorrent`/`intervals` section is valid); a password equal to the placeholder or empty while env is not set - **refuse to start** with instructions (exit code 78).
 
 ### 5.2 JSON config schema
 
@@ -134,6 +138,7 @@ qBittorrent port updater for ProtonVPN/   <- workspace (a path with spaces)
   "intervals": {
     "connected_s": 15,             // log poll while the log exists and we read it
     "offline_s": 60,               // poll when the log does not exist / VPN is not connected
+    "reconcile_s": 300,            // periodic comparison even when the log port does not change
     "qbit_backoff_base_s": 5,      // qBittorrent unavailable
     "qbit_backoff_max_s": 120,
     "auth_backoff_base_s": 60,     // bad login (do not hammer a ban)
@@ -164,6 +169,7 @@ qBittorrent port updater for ProtonVPN/   <- workspace (a path with spaces)
   "intervals": {
     "connected_s": 15,
     "offline_s": 60,
+    "reconcile_s": 300,
     "qbit_backoff_base_s": 5,
     "qbit_backoff_max_s": 120,
     "auth_backoff_base_s": 60,
@@ -182,9 +188,10 @@ protonport.py [--config PATH] [--dry-run] [--force] [--once] [--check] [--versio
 - `--config PATH` - path to the config (default `~/.config/protonport/protonport.conf`).
 - `--dry-run` - overrides the config `dry_run` to true.
 - `--force` - overrides `force_on_start` to true.
-- `--once` - runs **one** synchronization cycle and exits (handy for testing / cron). It still does the follow and self-healing in a single pass.
-- `--check` - prints: does the log exist? the latest port from the log? the current `listen_port` from qBittorrent? connection state? then exits. A debugging tool.
+- `--once` - runs **one** synchronization cycle and exits (handy for testing / cron). It still does the follow and self-healing in a single pass. Returns `4` when the sync could not be confirmed (qBittorrent unavailable/backoff, no port in the log).
+- `--check` - prints: does the log exist? the latest port from the log? the current `listen_port` from qBittorrent? connection state? then exits. A debugging tool; returns `4` on an out-of-sync port.
 - Unknown switches -> usage on stderr + exit code 2.
+- Config/credentials errors -> exit code 78 (`EX_CONFIG`; the systemd unit has `RestartPreventExitStatus=78` so it does not restart-loop).
 - The lock/single-instance applies to all modes except `--check`.
 
 ---
@@ -243,7 +250,9 @@ In `state_dir/protonport.state.json` (default `~/.local/state/protonport/protonp
   "follow": {               // what we are currently watching (the vpn-app.log file)
     "dev": 2065,            // st_dev
     "ino": 9912345,         // st_ino
-    "offset": 123456        // byte offset where we stopped reading
+    "offset": 123456,       // byte offset where we stopped reading
+    "prefix_sha256": "...", // SHA-256 of the first prefix_len bytes (copytruncate detection)
+    "prefix_len": 256       // how many bytes the fingerprint covers (<= 256)
   },
   "last_seen_port": null,   // the last port we ever read from the log
   "last_applied_port": null // the last port actually sent to qBittorrent (null = unknown)
@@ -369,14 +378,16 @@ def handle_file_change(state, st):
     #    restores the current state (§7.4). It runs only when last_seen is None.
 ```
 
-Note: if the rotation were of the **copytruncate** type (same inode, truncation), the guard in §7.3 (`offset > size`) catches it and reads the port with a tail-scan.
+Note: for the **copytruncate** type (same inode, truncation) the size guard (`offset > size`) alone is not reliable - the file can be truncated and grow back past the old offset between two ticks. Therefore the state also stores `prefix_sha256` (SHA-256 of the first 256 bytes of the watched file). A changed prefix means the file was truncated/rewritten: the offset is reset to 0, the binary buffer is dropped and a tail-scan self-heals the port. A state file from an older version (no fingerprint) is migrated on the first tick without a reset.
 
 #### 7.3.3 "Empty / very new log" detection
 The tail-scan (§7.4) runs when we still know no port after reading (`last_seen_port is None`) - this also covers the case when `vpn-app.log` has just been emptied/is new and the real state is in `.log.1`.
 
 ### 7.4 Startup synchronization / self-healing
 
-Goal: after a start, bring qBittorrent in sync with the current forwarded port, even if nothing changes while the program runs.
+Goal: after a start, and then periodically, bring qBittorrent in sync with the current forwarded port, even if nothing changes while the program runs.
+
+Besides the startup call, the same self-healing runs every `reconcile_s` (default 300 s) and after any rotation/truncation. That catches a manual change in qBittorrent (or a restart with an old `listen_port`) while the forwarded port stays the same.
 
 ```python
 def current_forwarded_port(cfg):
@@ -452,6 +463,7 @@ Rules:
 | Situation | Interval |
 |---|---|
 | log exists, normal follow | `connected_s` = 15 s |
+| periodic reconciliation of qBittorrent | `reconcile_s` = 300 s |
 | log missing (VPN app did not start) | `offline_s` = 60 s |
 | qBittorrent unavailable | backoff 5 -> 120 s |
 | login failure | backoff 60 -> 600 s |
@@ -622,8 +634,9 @@ In the config set `own_log_file` to a custom log (e.g. `~/.local/state/protonpor
 
 ### 10.1 Permissions and secrets
 - The config with the password: **0600**, owner = the user; at startup the script checks it and prints a WARNING on wider permissions (recommending `chmod 600`).
-- The password is NEVER in the code/repo; only the `__CHANGE_ME__` placeholder is in the repo.
-- The script **does not accept** the password via arguments (it would be visible in `ps`/journal) - only the config (0600) or env.
+- The password/API key are NEVER in the code/repo; only the `__CHANGE_ME__` placeholder is in the repo.
+- The script **does not accept** the password/key via arguments (they would be visible in `ps`/journal) - only the config (0600) or env (`PROTONPORT_QBIT_PASSWORD` / `PROTONPORT_QBIT_API_KEY`).
+- The qBittorrent client disables environment proxies (`ProxyHandler({})`), so the API key is never sent to an `HTTP(S)_PROXY` configured in the environment.
 - No secret is **logged** (not even `username` on an error; definitely never the password).
 - The state file with the offset: **0600** (it holds no secret, but keeps the principle).
 - The config validation rejects a placeholder/empty password (except when env is set) - the program must not run with an invalid config.
@@ -648,13 +661,14 @@ In the config set `own_log_file` to a custom log (e.g. `~/.local/state/protonpor
 ### 10.6 Further edge cases
 | Case | Behaviour |
 |---|---|
-| Port equal to the current one in qBittorrent | no POST, only an info log (§7.5) |
+| Port equal to the current one in qBittorrent | no POST, only a DEBUG log (§7.5) |
 | Port 0 / outside 1024-65535 | ignore + WARNING |
 | Duplicate renewal lines | dedup via `last_seen_port` |
 | SID cookie expired / 403 on preferences | automatic re-login + 1 retry |
 | IP ban after many bad logins | slow auth-backoff 60->600 s, a clear message |
 | `internal_port` != `external_port` | WARNING, `internal_port` is used (they are equal in the Proton model) |
-| qBittorrent GUI changed the port manually in the meantime | the next renewal compares and reverts it (desired - the watcher is the source of truth) |
+| qBittorrent GUI changed the port manually in the meantime | the periodic reconciliation (`reconcile_s`) compares and reverts it (desired - the watcher is the source of truth) |
+| copytruncate + regrowth past the old offset | detected by the stored prefix fingerprint, offset reset + self-healing (§7.3) |
 | VPN disconnected | renewals stop - nothing happens, the last port stays; after a reconnect a new port |
 | VPN disconnected and qBittorrent (bound to proton0) unavailable | backoff; catches up after recovery |
 | unexpected exception in a tick | caught, traceback to the log, continue; systemd Restart as a safety net |
@@ -671,6 +685,8 @@ In the config set `own_log_file` to a custom log (e.g. `~/.local/state/protonpor
 5. Rotation test - write > 3 MiB of dummy lines into the log (in a controlled way, on a copy of the path in the config) - the watcher must switch to the new file and find the port with a tail-scan.
 6. Wrong-password test - auth-backoff and a clear message, no hammering.
 7. Two-instance test - the second one exits with code 3.
+
+Automated: `python3 -m unittest discover -s tests -v` (stdlib only) covers parsing, config merging/validation, rename rotation, copytruncate, reconciliation, dry-run, API-key mode, proxy bypass and the CLI exit codes, against a fake qBittorrent Web API.
 
 ---
 

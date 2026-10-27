@@ -8,13 +8,15 @@ Port source: parsed from the protonvpn-app log (~/.cache/Proton/VPN/logs/vpn-app
 qBittorrent update: exclusively through the Web API (setPreferences, form field `json`).
 Details and rationale: see DESIGN.md.
 
-Implementation: Python 3, pure standard library (urllib, http.cookiejar, json, re,
-os, fcntl, time, logging, argparse). No pip packages, no external curl/jq.
+Implementation: Python 3.8+, pure standard library (urllib, http.cookiejar,
+json, re, os, fcntl, time, logging, argparse, hashlib). No pip packages, no
+external curl/jq.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.cookiejar
 import json
 import logging
@@ -24,6 +26,7 @@ import socket
 import ssl
 import sys
 import time
+from logging.handlers import RotatingFileHandler
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
@@ -34,7 +37,7 @@ except ImportError:  # pragma: no cover - watcher is Linux-only
     fcntl = None  # type: ignore[assignment]
 
 APP_NAME = "protonport"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Default paths / names (no spaces in these paths - see DESIGN.md §4).
 DEFAULT_CONFIG = os.path.join(os.path.expanduser("~"), ".config", "protonport", "protonport.conf")
@@ -45,16 +48,24 @@ LOCK_FILE = "protonport.lock"
 
 # Secrets.
 ENV_PASSWORD = "PROTONPORT_QBIT_PASSWORD"
+ENV_API_KEY = "PROTONPORT_QBIT_API_KEY"
 PASSWORD_PLACEHOLDER = "__CHANGE_ME__"
 
 # Valid port range (0 or out-of-range values are ignored with a WARNING).
 PORT_MIN, PORT_MAX = 1024, 65535
 
+# Follow-the-log limits (defense against a corrupt / pathological log).
+READ_CHUNK_BYTES = 4 * 1024 * 1024   # max bytes read from the log per tick
+MAX_PENDING_BYTES = 1024 * 1024      # max incomplete trailing line kept in memory
+PREFIX_BYTES = 256                   # prefix fingerprint (copytruncate detection)
+
 # Exit codes.
 EXIT_OK = 0
-EXIT_ERROR = 1      # config error / unexpected error
-EXIT_USAGE = 2      # argparse uses 2 itself
-EXIT_RUNNING = 3    # another instance is already running (flock)
+EXIT_ERROR = 1       # unexpected error
+EXIT_USAGE = 2       # argparse uses 2 itself
+EXIT_RUNNING = 3     # another instance is already running (flock)
+EXIT_UNSYNC = 4      # --once/--check: qBittorrent could not be brought in sync
+EXIT_CONFIG = 78     # configuration/credentials error (sysexits EX_CONFIG)
 
 log = logging.getLogger(APP_NAME)
 
@@ -66,11 +77,16 @@ log = logging.getLogger(APP_NAME)
 # A) Direct port source: both renewals and new assignments, filtered by the
 #    port_forwarding.rs module and the text "Receiving Response" (Sending
 #    Request lines from the same module never pass - see DESIGN.md §6.3).
+#    The body is captured whole and the fields are parsed separately, so the
+#    order of internal_port/external_port does not matter (a ProtonVPN update
+#    may reorder them).
 PORT_RENEW_RE = re.compile(
     r"\|\s*proton\.vpn\.platform/port_forwarding\.rs:\d+\s*\|\s*\w+\s*\|\s*"
-    r"Receiving Response\s*\{[^{}]*?internal_port:\s*(\d{1,5})[^{}]*?external_port:\s*(\d{1,5})",
+    r"Receiving Response\s*\{([^{}]*)\}",
     re.MULTILINE,
 )
+INTERNAL_PORT_RE = re.compile(r"\binternal_port:\s*(\d{1,5})")
+EXTERNAL_PORT_RE = re.compile(r"\bexternal_port:\s*(\d{1,5})")
 
 # B) Marker of a new assignment - OBSERVABILITY ONLY (it carries no port).
 ASSIGNED_RE = re.compile(
@@ -84,15 +100,29 @@ CONNECTED_RE = re.compile(r"CONN:STATE_CHANGED\s*\|\s*Connected")
 
 
 def port_from_match(match: "re.Match[str]") -> "int | None":
-    """Validate a captured port (internal_port is authoritative)."""
-    try:
-        internal = int(match.group(1))
-        external = int(match.group(2))
-    except (ValueError, TypeError):
+    """Parse and validate a port from a full "Receiving Response" body.
+
+    ``internal_port`` is authoritative (and required); ``external_port`` is
+    optional and only used for an anomaly warning.
+    """
+    body = match.group(1)
+    internal_match = INTERNAL_PORT_RE.search(body)
+    if internal_match is None:
         return None
-    if internal != external:
-        # In the Proton model they are equal (port forwarding without NAT).
-        log.warning("Anomaly: internal_port %s != external_port %s - using internal_port.", internal, external)
+    try:
+        internal = int(internal_match.group(1))
+    except ValueError:
+        return None
+    external_match = EXTERNAL_PORT_RE.search(body)
+    if external_match is not None:
+        try:
+            external = int(external_match.group(1))
+        except ValueError:
+            external = internal
+        if internal != external:
+            # In the Proton model they are equal (port forwarding without NAT).
+            log.warning("Anomaly: internal_port %s != external_port %s - using internal_port.",
+                        internal, external)
     if not (PORT_MIN <= internal <= PORT_MAX):
         log.warning("Port %s is outside the valid range %d-%d - ignoring.", internal, PORT_MIN, PORT_MAX)
         return None
@@ -219,17 +249,20 @@ class QBittorrent:
         self.log = logger
         self.jar = http.cookiejar.CookieJar()
         self.insecure_https = bool(qb["insecure_https"])
+        # An empty ProxyHandler disables the env proxies (HTTP_PROXY/HTTPS_PROXY):
+        # qBittorrent is (by default) local, and the API key must never be sent
+        # to a proxy just because one is configured in the environment.
+        handlers = [urlrequest.ProxyHandler({}), urlrequest.HTTPCookieProcessor(self.jar)]
         if self.insecure_https:
             # HTTPS with a self-signed cert (loopback): non-verifying SSL context
             # (insecure_https: true in the config) - see §8 / DESIGN. Plain HTTP
             # is unaffected; the handler only applies to https URLs.
-            self.opener = urlrequest.build_opener(
-                urlrequest.HTTPCookieProcessor(self.jar),
-                urlrequest.HTTPSHandler(context=ssl._create_unverified_context()),
-            )
-        else:
-            # Default: verifying SSL context (HTTP and HTTPS with a valid cert).
-            self.opener = urlrequest.build_opener(urlrequest.HTTPCookieProcessor(self.jar))
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            handlers.append(urlrequest.HTTPSHandler(context=context))
+        # Default: verifying SSL context (HTTP and HTTPS with a valid cert).
+        self.opener = urlrequest.build_opener(*handlers)
         # API-key mode: no login is needed - on a matching key the server creates
         # a session by itself (and the session NEVER expires), so authed = True
         # right from the start.
@@ -390,6 +423,8 @@ class Watcher:
         intervals = cfg["intervals"]
         self.qbit_bo = Backoff(intervals["qbit_backoff_base_s"], intervals["qbit_backoff_max_s"])
         self.auth_bo = Backoff(intervals["auth_backoff_base_s"], intervals["auth_backoff_max_s"])
+        self.reconcile_s = float(intervals["reconcile_s"])
+        self._next_reconcile = time.monotonic() + self.reconcile_s
 
     # -- state --------------------------------------------------------------
     def save_state(self) -> None:
@@ -398,6 +433,23 @@ class Watcher:
     def _remember_port(self, port: int) -> None:
         self.state["last_seen_port"] = port
         self.save_state()
+
+    def has_pending_work(self) -> bool:
+        """True when the sync is not finished (--once uses this for its exit code)."""
+        return (self.pending_port is not None
+                or self.qbit_bo.in_wait() or self.auth_bo.in_wait())
+
+    @staticmethod
+    def _prefix_hash(path: str, length: int) -> "str | None":
+        """SHA-256 of exactly ``length`` bytes from the start of the file."""
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read(max(0, length))
+        except OSError:
+            return None
+        if len(data) != length:
+            return None
+        return hashlib.sha256(data).hexdigest()
 
     # -- main tick ----------------------------------------------------------
     def tick(self) -> float:
@@ -426,11 +478,54 @@ class Watcher:
             self.flush_pending()
             return float(cfg["intervals"]["connected_s"])
 
-        # Guard against the copytruncate rotation variant (offset > size).
+        # Guard against the copytruncate rotation variant. The size check alone is
+        # not enough: the file can be truncated and grow back past the old offset
+        # between two ticks. The prefix fingerprint detects that reliably.
+        prefix_len = min(PREFIX_BYTES, st.st_size)
+        prefix = self._prefix_hash(cfg["log_path"], prefix_len)
+        expected_prefix = follow.get("prefix_sha256")
+        expected_len = follow.get("prefix_len")
+        offset = follow.get("offset", 0)
+        if prefix is not None:
+            if expected_prefix is None or offset == 0:
+                # Migration from an older state file / nothing read yet: nothing
+                # was skipped, so just remember the fingerprint.
+                follow["prefix_sha256"] = prefix
+                follow["prefix_len"] = prefix_len
+                self.save_state()
+            elif expected_len is None:
+                # State with a fingerprint but without its length - migrate.
+                follow["prefix_sha256"] = prefix
+                follow["prefix_len"] = prefix_len
+                self.save_state()
+            else:
+                # Compare only the bytes covered by the stored fingerprint; a
+                # grown file therefore does not produce a false positive.
+                same_len = self._prefix_hash(cfg["log_path"], expected_len)
+                if same_len is None or same_len != expected_prefix:
+                    self.log.warning("The log was truncated/rewritten "
+                                     "(content prefix changed) - self-healing.")
+                    follow["offset"] = 0
+                    follow["prefix_sha256"] = prefix
+                    follow["prefix_len"] = prefix_len
+                    self.pending_bytes = b""
+                    self.save_state()
+                    self.self_heal()
+                    self.flush_pending()
+                    return float(cfg["intervals"]["connected_s"])
+                if prefix_len > expected_len:
+                    # The file grew beyond the fingerprinted prefix - extend it.
+                    follow["prefix_sha256"] = prefix
+                    follow["prefix_len"] = prefix_len
+                    self.save_state()
+
+        # Belt and braces: offset past EOF (e.g. a state file without fingerprint).
         if follow.get("offset", 0) > st.st_size:
             self.log.warning("File was truncated (offset %s > size %s) - self-healing.",
                              follow.get("offset"), st.st_size)
             follow["offset"] = 0
+            if prefix is not None:
+                follow["prefix_sha256"] = prefix
             self.pending_bytes = b""
             self.save_state()
             self.self_heal()
@@ -444,6 +539,12 @@ class Watcher:
         # §7.3.3: the log exists, but we do not know any port yet - tail-scan
         # (also covers a freshly emptied log where the real state is in .log.1).
         if self.state.get("last_seen_port") is None:
+            self.self_heal()
+        elif time.monotonic() >= self._next_reconcile:
+            # Periodic reconciliation: catches a manual change in qBittorrent
+            # (or a restart with an old listen_port) even while the forwarded
+            # port stays the same. The comparison itself is cheap and dedup'd.
+            self._next_reconcile = time.monotonic() + self.reconcile_s
             self.self_heal()
 
         self.flush_pending()
@@ -485,7 +586,14 @@ class Watcher:
             # Rotation: the new file is chronologically NEWER - read from the start.
             offset = 0
 
-        self.state["follow"] = {"dev": st.st_dev, "ino": st.st_ino, "offset": offset}
+        prefix_len = min(PREFIX_BYTES, st.st_size)
+        self.state["follow"] = {
+            "dev": st.st_dev,
+            "ino": st.st_ino,
+            "offset": offset,
+            "prefix_sha256": self._prefix_hash(cfg["log_path"], prefix_len),
+            "prefix_len": prefix_len,
+        }
         self.pending_bytes = b""
         self.save_state()
         self.log.info("Watching a new file (dev=%s, ino=%s), offset=%s.", st.st_dev, st.st_ino, offset)
@@ -509,14 +617,18 @@ class Watcher:
             if offset > size:
                 return []  # truncated - the guard in tick triggers self-healing
             fh.seek(offset)
-            data = fh.read()
-            follow["offset"] = size
+            data = fh.read(READ_CHUNK_BYTES)
+            follow["offset"] = offset + len(data)  # the rest is read on the next tick
 
         # We never cut through the middle of a UTF-8 character: the buffer is kept
         # binary and complete lines are only split after a \n.
         raw = self.pending_bytes + data
         nl = raw.rfind(b"\n")
         if nl == -1:
+            if len(raw) > MAX_PENDING_BYTES:
+                self.log.warning("Incomplete log line exceeds %d bytes - discarding it.",
+                                 MAX_PENDING_BYTES)
+                raw = b""
             self.pending_bytes = raw  # incomplete trailing line - next tick
             self.save_state()
             return []
@@ -544,9 +656,11 @@ class Watcher:
         """§7.4 - tail-scan and bring qBittorrent into sync.
 
         Always compares qBittorrent's current listen_port with the forwarded port
-        (attempt_sync dedups a match itself - so no unnecessary POST). This also
-        covers "qBittorrent was changed manually in the meantime" (DESIGN.md
-        §1.3 / §7.4 / §10.6). ``force`` (--force) forces a POST even on a match.
+        (attempt_sync dedups a match itself - so no unnecessary POST). Called at
+        startup, after a rotation/truncation and periodically (``reconcile_s``),
+        so it also covers "qBittorrent was changed manually in the meantime"
+        (DESIGN.md §1.3 / §7.4 / §10.6). ``force`` (--force) forces a POST even
+        on a match.
         """
         fwd = current_forwarded_port(self.cfg)
         if fwd is None:
@@ -585,7 +699,9 @@ class Watcher:
 
         if current == port and not force:
             self._qbit_ok()
-            self.log.info("Port %s is already set in qBittorrent - no unnecessary call.", port)
+            # DEBUG: the periodic reconciliation would otherwise log this every
+            # reconcile_s seconds.
+            self.log.debug("Port %s is already set in qBittorrent - no unnecessary call.", port)
             return "ok"
 
         if self.cfg["dry_run"]:
@@ -641,13 +757,12 @@ TOP_KEYS = {
 }
 QB_KEYS = {"base_url", "username", "password", "api_key", "http_timeout_s", "insecure_https"}
 INTERVAL_KEYS = {
-    "connected_s", "offline_s", "qbit_backoff_base_s", "qbit_backoff_max_s",
-    "auth_backoff_base_s", "auth_backoff_max_s",
+    "connected_s", "offline_s", "reconcile_s", "qbit_backoff_base_s",
+    "qbit_backoff_max_s", "auth_backoff_base_s", "auth_backoff_max_s",
 }
 
 
 def default_config() -> dict:
-    home = os.path.expanduser("~")
     return {
         "log_path": DEFAULT_LOG,
         "state_dir": DEFAULT_STATE_DIR,
@@ -664,6 +779,7 @@ def default_config() -> dict:
         "intervals": {
             "connected_s": 15,
             "offline_s": 60,
+            "reconcile_s": 300,
             "qbit_backoff_base_s": 5,
             "qbit_backoff_max_s": 120,
             "auth_backoff_base_s": 60,
@@ -677,6 +793,8 @@ def default_config() -> dict:
 
 
 def _merge_section(target: dict, section: dict, allowed: set, path_label: str) -> None:
+    if not isinstance(section, dict):
+        raise ConfigError("%s must be a JSON object." % path_label)
     for key, value in section.items():
         if key not in allowed:
             raise ConfigError("Unknown key '%s' in %s (typo?)." % (key, path_label))
@@ -696,15 +814,19 @@ def load_config(path: str, require_credentials: bool = True) -> dict:
             user = json.load(fh)
     except FileNotFoundError:
         raise ConfigError("Configuration not found: %s\n"
-                          "Copy protonport.conf.example and fill in the credentials." % path)
+                          "Copy protonport.conf.example and fill in the credentials." % path) from None
     except json.JSONDecodeError as exc:
-        raise ConfigError("Invalid JSON in %s: %s" % (path, exc))
+        raise ConfigError("Invalid JSON in %s: %s" % (path, exc)) from exc
     if not isinstance(user, dict):
         raise ConfigError("Configuration %s must be a JSON object." % path)
 
     cfg = default_config()
     cfg["_config_path"] = os.path.abspath(path)
-    _merge_section(cfg, user, TOP_KEYS, "the configuration")
+    # The nested sections are merged INTO the defaults (never replace them), so a
+    # partial "qbittorrent"/"intervals" section keeps the built-in values.
+    top_level = {key: value for key, value in user.items()
+                 if key not in ("qbittorrent", "intervals")}
+    _merge_section(cfg, top_level, TOP_KEYS, "the configuration")
 
     qb = cfg["qbittorrent"]
     _merge_section(qb, user.get("qbittorrent", {}), QB_KEYS, "'qbittorrent'")
@@ -713,15 +835,30 @@ def load_config(path: str, require_credentials: bool = True) -> dict:
     # --- normalization and validation ---
     # Paths: support ~ and variables ($HOME) for a portable template.
     for path_key in ("log_path", "state_dir", "own_log_file"):
-        cfg[path_key] = os.path.expanduser(os.path.expandvars(str(cfg[path_key])))
+        if not isinstance(cfg[path_key], str):
+            raise ConfigError("'%s' must be a string path." % path_key)
+        cfg[path_key] = os.path.expanduser(os.path.expandvars(cfg[path_key]))
+    if not cfg["log_path"].strip():
+        raise ConfigError("'log_path' is empty.")
+    if not cfg["state_dir"].strip():
+        raise ConfigError("'state_dir' is empty.")
 
-    cfg["log_level"] = str(cfg["log_level"]).upper()
+    if not isinstance(cfg["log_level"], str):
+        raise ConfigError("'log_level' must be a string (DEBUG|INFO|WARNING|ERROR).")
+    cfg["log_level"] = cfg["log_level"].upper()
     if cfg["log_level"] not in ("DEBUG", "INFO", "WARNING", "ERROR"):
         raise ConfigError("Unknown log level '%s' (DEBUG|INFO|WARNING|ERROR)." % cfg["log_level"])
 
-    if not str(qb["base_url"]).strip():
-        raise ConfigError("Key 'qbittorrent.base_url' is empty.")
-    qb["base_url"] = str(qb["base_url"]).rstrip("/")
+    if not isinstance(qb["base_url"], str) or not qb["base_url"].strip():
+        raise ConfigError("Key 'qbittorrent.base_url' is empty or not a string.")
+    qb["base_url"] = qb["base_url"].strip().rstrip("/")
+    parsed_url = urlparse.urlsplit(qb["base_url"])
+    if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
+        raise ConfigError("'qbittorrent.base_url' must be an http:// or https:// URL, got %r."
+                          % qb["base_url"])
+    for name in ("username", "password", "api_key"):
+        if qb[name] is not None and not isinstance(qb[name], str):
+            raise ConfigError("'qbittorrent.%s' must be a string." % name)
 
     for name, value in list(qb.items()):
         if name in ("username", "password", "api_key", "base_url", "insecure_https"):
@@ -741,9 +878,14 @@ def load_config(path: str, require_credentials: bool = True) -> dict:
 
     # --- authentication: EITHER api_key (Bearer) OR username+password (§8.5) ---
     # api_key: an empty string / the __CHANGE_ME__ placeholder = not set (the
-    # same convention as the password). A set api_key takes PRIORITY and the
-    # password is then ignored completely (it is never sent to qBittorrent).
+    # same convention as the password). The env variable takes priority (it lets
+    # you keep the key off the disk, just like the password). A set api_key takes
+    # PRIORITY and the password is then ignored completely (it is never sent to
+    # qBittorrent).
     api_key = str(qb.get("api_key") or "").strip()
+    env_api_key = (os.environ.get(ENV_API_KEY) or "").strip()
+    if env_api_key:
+        api_key = env_api_key
     if api_key in ("", PASSWORD_PLACEHOLDER):
         api_key = ""
 
@@ -775,8 +917,9 @@ def load_config(path: str, require_credentials: bool = True) -> dict:
             "  * 'qbittorrent.api_key'  - API key (recommended): in qBittorrent\n"
             "    Options -> Web UI -> Authentication -> API Key (Copy button),\n"
             "  * OR 'qbittorrent.username' + 'qbittorrent.password'\n"
-            "    (the password can also be passed via the %s variable).\n"
-            "Secrets are never stored in the code." % (path, ENV_PASSWORD))
+            "    (the key/password can also be passed via %s / %s).\n"
+            "Secrets are never stored in the code."
+            % (path, ENV_API_KEY, ENV_PASSWORD))
 
     return cfg
 
@@ -805,7 +948,8 @@ def init_logger(cfg: dict) -> logging.Logger:
         parent = os.path.dirname(own)
         if parent:
             os.makedirs(parent, mode=0o700, exist_ok=True)
-        handler = logging.FileHandler(own, encoding="utf-8")
+        handler = RotatingFileHandler(own, maxBytes=1024 * 1024, backupCount=3,
+                                      encoding="utf-8")
     else:
         handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(fmt)
@@ -865,6 +1009,14 @@ def load_state(state_dir: str) -> dict:
                 follow["ino"] = int(follow["ino"])
             except (TypeError, ValueError):
                 follow = None
+            if follow is not None:
+                # Optional (state from an older version has none - it is filled
+                # in on the next tick without a reset).
+                if not isinstance(follow.get("prefix_sha256"), str):
+                    follow["prefix_sha256"] = None
+                prefix_len = follow.get("prefix_len")
+                if not isinstance(prefix_len, int) or not 0 <= prefix_len <= PREFIX_BYTES:
+                    follow["prefix_len"] = None
         state["follow"] = follow
     if state["last_seen_port"] is not None:
         try:
@@ -914,6 +1066,10 @@ def do_check(cfg: dict, logger: logging.Logger) -> int:
     else:
         lines.append("Forwarded port from the log:  %d" % fwd)
 
+    state = load_state(cfg["state_dir"])
+    if state.get("last_applied_port") is not None:
+        lines.append("Last port applied by protonport:  %d" % state["last_applied_port"])
+
     qb = cfg["qbittorrent"]
     if qb.get("api_key"):
         auth_label = "Auth: API key (Bearer)"
@@ -929,7 +1085,8 @@ def do_check(cfg: dict, logger: logging.Logger) -> int:
         lines.append("qBittorrent:  skipped - neither 'api_key' nor 'username'/'password' is set.")
         lines.append("              In %s (mode 0600) add EITHER 'qbittorrent.api_key'" % cfg["_config_path"])
         lines.append("              (recommended - Options->Web UI->Authentication->API Key),")
-        lines.append("              OR 'username' + 'password' (password also via env %s)." % ENV_PASSWORD)
+        lines.append("              OR 'username' + 'password' (key/password also via env %s / %s)."
+                     % (ENV_API_KEY, ENV_PASSWORD))
         lines.append("=== done (the Web API was NOT contacted - read-only) ===")
         print("\n".join(lines))
         return EXIT_OK
@@ -951,22 +1108,26 @@ def do_check(cfg: dict, logger: logging.Logger) -> int:
         print("\n".join(lines))
         return EXIT_ERROR
 
+    exit_code = EXIT_OK
     try:
         current = qbit.get_listen_port()
         lines.append("qBittorrent listen_port:  %d" % current)
         if fwd is not None and fwd != current:
             lines.append("Status:  OUT OF SYNC - qBittorrent (%d) != log (%d)." % (current, fwd))
-            lines.append("         It will be fixed automatically at the next renewal, or run:  --once")
+            lines.append("         It will be fixed automatically on the next reconciliation "
+                         "(reconcile_s), or run:  --once")
+            exit_code = EXIT_UNSYNC
         elif fwd is not None:
             lines.append("Status:  in sync (%d)." % fwd)
         else:
             lines.append("Status:  cannot compare - the port from the log is still unknown.")
     except (AuthError, QbitUnavailable) as exc:
         lines.append("qBittorrent listen_port:  cannot be read - %s" % exc)
+        exit_code = EXIT_ERROR
 
     lines.append("=== done ===")
     print("\n".join(lines))
-    return EXIT_OK
+    return exit_code
 
 
 # ---------------------------------------------------------------------------
@@ -1008,7 +1169,7 @@ def main(argv: "list[str] | None" = None) -> int:
         cfg = load_config(args.config or DEFAULT_CONFIG, require_credentials=require_credentials)
     except ConfigError as exc:
         print("%s: configuration error: %s" % (APP_NAME, exc), file=sys.stderr)
-        return EXIT_ERROR
+        return EXIT_CONFIG
 
     if args.dry_run:
         cfg["dry_run"] = True
@@ -1043,6 +1204,13 @@ def main(argv: "list[str] | None" = None) -> int:
             except Exception:
                 logger.exception("Unexpected error during the one-shot cycle.")
                 return EXIT_ERROR
+            # A cron/test caller must be able to tell "synced" from "could not sync".
+            if (watcher.has_pending_work()
+                    or watcher.state.get("last_seen_port") is None
+                    or current_forwarded_port(cfg) is None):
+                logger.warning("The one-shot cycle finished without a completed "
+                               "synchronization (exit %d).", EXIT_UNSYNC)
+                return EXIT_UNSYNC
             return EXIT_OK
 
         while True:
